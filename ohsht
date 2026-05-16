@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""ohsht — simple system backup. Zero deps, one file."""
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+RSYNC_EXCLUDES = [
+    "/dev/*", "/proc/*", "/sys/*", "/tmp/*",
+    "/run/*", "/mnt/*", "/media/*", "/lost+found",
+    "/swapfile", "/swap.img",
+    "/var/cache/apt/archives/*.deb",
+    ".cache/*",
+]
+
+RSYNC_FLAGS = "-aAXHSx", "--numeric-ids", "--info=progress2"
+
+TMP_MOUNT = Path("/mnt/ohsht")
+
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def run(cmd, dry_run=False, **kwargs):
+    if dry_run:
+        eprint(f"  [dry-run] {' '.join(map(str, cmd))}")
+        return
+    kwargs.setdefault("check", True)
+    return subprocess.run(cmd, **kwargs)
+
+
+def get_mounts():
+    mounts = {}
+    with open("/proc/mounts") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            dev, mp, fstype = parts[0], parts[1], parts[2]
+            if fstype in ("tmpfs", "devtmpfs", "proc", "sysfs", "cgroup",
+                          "cgroup2", "devpts", "pstore", "securityfs",
+                          "efivarfs", "autofs", "tracefs", "bpf", "ramfs",
+                          "overlay", "fuse.portal", "squashfs"):
+                continue
+            if not dev.startswith("/dev/") or not os.path.exists(dev):
+                continue
+            mounts[mp] = dev
+    return mounts
+
+
+def target_kind(target):
+    name = os.path.basename(target)
+    if name.startswith("nvme"):
+        return "partition" if "p" in name[name.rfind("n"):] else "disk"
+    return "partition" if name[-1].isdigit() else "disk"
+
+
+def partition_disk(disk, dry_run=False):
+    eprint(f"Partitioning {disk}...")
+    run(["parted", "-s", disk, "mklabel", "gpt",
+         "mkpart", "primary", "ext4", "0%", "100%"], dry_run)
+    run(["partprobe", disk], dry_run)
+    time.sleep(1)
+
+
+def partition_path(disk):
+    name = os.path.basename(disk)
+    return f"{disk}p1" if name.startswith("nvme") else f"{disk}1"
+
+
+def fmt(part, dry_run=False):
+    eprint(f"Formatting {part}...")
+    run(["mkfs.ext4", "-F", "-L", "OHSHT", part], dry_run)
+
+
+def do_mount(dev, mp, dry_run=False):
+    mp.mkdir(parents=True, exist_ok=True)
+    run(["mount", dev, str(mp)], dry_run)
+
+
+def do_umount(mp, dry_run=False):
+    run(["umount", str(mp)], dry_run)
+
+
+def rsync_backup(mounts, dest, dry_run=False):
+    for mp, dev in mounts.items():
+        rel = mp.lstrip("/") or "root"
+        rel = rel.replace("/", "-") if "/" in rel else rel
+        target = dest / rel
+        target.mkdir(parents=True, exist_ok=True)
+        eprint(f"\n  {mp} ({dev}) → {target}/")
+        cmd = ["rsync", *RSYNC_FLAGS]
+        for excl in RSYNC_EXCLUDES:
+            cmd.extend(["--exclude", excl])
+        cmd.extend([f"{mp}/", f"{target}/"])
+        run(cmd, dry_run)
+
+
+def rsync_restore(src, mounts, dry_run=False):
+    for mp, dev in mounts.items():
+        rel = mp.lstrip("/") or "root"
+        rel = rel.replace("/", "-") if "/" in rel else rel
+        sdir = src / rel
+        if not sdir.exists():
+            eprint(f"  [skip] {sdir} not found")
+            continue
+        eprint(f"\n  {sdir}/ → {mp}")
+        cmd = ["rsync", *RSYNC_FLAGS]
+        for excl in RSYNC_EXCLUDES:
+            cmd.extend(["--exclude", excl])
+        cmd.extend([f"{sdir}/", f"{mp}/"])
+        run(cmd, dry_run)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="ohsht — dead simple system backup tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  sudo ohsht /dev/sda           full disk (partition+format+rsync)\n"
+            "  sudo ohsht /dev/sda1          existing partition\n"
+            "  sudo ohsht /dev/sda1 --fmt    format first\n"
+            "  sudo ohsht /dev/sda1 -R       restore system\n"
+            "  sudo ohsht /dev/sda -n        preview\n"
+        ),
+    )
+    ap.add_argument("target", help="/dev/sda (disk) or /dev/sda1 (partition)")
+    ap.add_argument("--fmt", action="store_true", help="format partition first")
+    ap.add_argument("-R", "--restore", action="store_true", help="restore mode")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="preview only")
+    args = ap.parse_args()
+
+    if os.geteuid() != 0 and not args.dry_run:
+        eprint("error: need root (use sudo)")
+        sys.exit(1)
+
+    target = os.path.realpath(args.target)
+    if not os.path.exists(target):
+        eprint(f"error: {target} not found")
+        sys.exit(1)
+
+    kind = target_kind(target)
+    mounts = get_mounts()
+    if not mounts:
+        eprint("error: no physical mounts found")
+        sys.exit(1)
+
+    ts = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    if args.restore:
+        if not TMP_MOUNT.is_mount():
+            do_mount(target, TMP_MOUNT, args.dry_run)
+        rsync_restore(TMP_MOUNT, mounts, args.dry_run)
+        if not TMP_MOUNT.is_mount():
+            do_umount(TMP_MOUNT, args.dry_run)
+        eprint(f"\n✓ restored from {target} on {ts}")
+        return
+
+    part = target
+    if kind == "disk":
+        partition_disk(target, args.dry_run)
+        part = partition_path(target)
+        if not args.dry_run:
+            for _ in range(10):
+                if os.path.exists(part):
+                    break
+                time.sleep(0.5)
+
+    if kind == "disk" or args.fmt:
+        fmt(part, args.dry_run)
+
+    if not TMP_MOUNT.is_mount():
+        do_mount(part, TMP_MOUNT, args.dry_run)
+
+    rsync_backup(mounts, TMP_MOUNT, args.dry_run)
+
+    if not args.dry_run:
+        info = TMP_MOUNT / "BACKUP_INFO.txt"
+        info_text = (
+            f"ohsht backup\n"
+            f"target: {target}\n"
+            f"date:   {ts}\n"
+            f"mounts:\n"
+        )
+        for mp, dev in mounts.items():
+            info_text += f"  {mp} = {dev}\n"
+        info.write_text(info_text)
+        eprint(f"  wrote {info}")
+        rsync_excludes_path = TMP_MOUNT / "RSYNC_EXCLUDES.txt"
+        rsync_excludes_path.write_text("\n".join(RSYNC_EXCLUDES) + "\n")
+
+    if not TMP_MOUNT.is_mount():
+        do_umount(TMP_MOUNT, args.dry_run)
+
+    eprint(f"\n✓ backed up to {part} on {ts}")
+
+
+if __name__ == "__main__":
+    main()
