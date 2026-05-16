@@ -87,6 +87,9 @@ def do_umount(mp, dry_run=False):
 
 
 def rsync_backup(mounts, dest, dry_run=False):
+    # Filter out the destination mount and any mounts nested under it
+    mounts = {mp: dev for mp, dev in mounts.items()
+              if mp != str(dest) and not mp.startswith(str(dest) + "/")}
     for mp, dev in mounts.items():
         rel = mp.lstrip("/") or "root"
         rel = rel.replace("/", "-") if "/" in rel else rel
